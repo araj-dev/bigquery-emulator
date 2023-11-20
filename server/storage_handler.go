@@ -488,14 +488,13 @@ func (s *storageWriteServer) appendRows(req *storagepb.AppendRowsRequest, msgDes
 	if status.finalized {
 		return fmt.Errorf("stream is already finalized")
 	}
-	offset := req.GetOffset().Value
 	rows := req.GetProtoRows().GetRows().GetSerializedRows()
 	data, err := s.decodeData(msgDesc, rows)
 	if err != nil {
 		s.sendErrorMessage(stream, streamName, err)
 		return err
 	}
-	if status.streamType == storagepb.WriteStream_COMMITTED {
+	if status.streamType == storagepb.WriteStream_COMMITTED || status.streamType == storagepb.WriteStream_TYPE_UNSPECIFIED {
 		ctx := context.Background()
 		ctx = logger.WithLogger(ctx, s.server.logger)
 
@@ -514,10 +513,18 @@ func (s *storageWriteServer) appendRows(req *storagepb.AppendRowsRequest, msgDes
 			s.sendErrorMessage(stream, streamName, err)
 			return err
 		}
+		if err := tx.Commit(); err != nil {
+			s.sendErrorMessage(stream, streamName, err)
+			return err
+		}
 	} else {
 		status.rows = append(status.rows, data...)
 	}
-	return s.sendResult(stream, streamName, offset+int64(len(rows)))
+	offsetVal := int64(0)
+	if offset := req.GetOffset(); offset != nil {
+		offsetVal = offset.Value
+	}
+	return s.sendResult(stream, streamName, offsetVal+int64(len(rows)))
 }
 
 func (s *storageWriteServer) sendResult(stream storagepb.BigQueryWrite_AppendRowsServer, streamName string, offset int64) error {
@@ -670,17 +677,16 @@ func (s *storageWriteServer) insertTableData(ctx context.Context, tx *connection
 
 func (s *storageWriteServer) GetWriteStream(ctx context.Context, req *storagepb.GetWriteStreamRequest) (*storagepb.WriteStream, error) {
 	s.mu.RLock()
-	req.GetName()
-	defer s.mu.RUnlock()
-	str := strings.Split(req.Name, "/streams/")
-	if len(str) != 2 {
-		return nil, fmt.Errorf("unexpected stream name %s", req.Name)
-	}
-	parent := str[0]
-	streamID := str[1]
-
 	streamStatus, exists := s.streamMap[req.Name]
+	s.mu.RUnlock()
 	if !exists {
+		str := strings.Split(req.Name, "/streams/")
+		if len(str) != 2 {
+			return nil, fmt.Errorf("unexpected stream name %s", req.Name)
+		}
+		parent := str[0]
+		streamID := str[1]
+
 		if streamID == "_default" {
 			stream, err := s.createDefaultStream(ctx, parent)
 			if err != nil {
