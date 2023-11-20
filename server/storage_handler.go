@@ -670,12 +670,27 @@ func (s *storageWriteServer) insertTableData(ctx context.Context, tx *connection
 
 func (s *storageWriteServer) GetWriteStream(ctx context.Context, req *storagepb.GetWriteStreamRequest) (*storagepb.WriteStream, error) {
 	s.mu.RLock()
+	req.GetName()
 	defer s.mu.RUnlock()
-	status, exists := s.streamMap[req.Name]
+	str := strings.Split(req.Name, "/streams/")
+	if len(str) != 2 {
+		return nil, fmt.Errorf("unexpected stream name %s", req.Name)
+	}
+	parent := str[0]
+	streamID := str[1]
+
+	streamStatus, exists := s.streamMap[req.Name]
 	if !exists {
+		if streamID == "_default" {
+			stream, err := s.createDefaultStream(ctx, parent)
+			if err != nil {
+				return nil, err
+			}
+			return stream, nil
+		}
 		return nil, fmt.Errorf("failed to find stream from %s", req.Name)
 	}
-	return status.stream, nil
+	return streamStatus.stream, nil
 }
 
 func (s *storageWriteServer) FinalizeWriteStream(ctx context.Context, req *storagepb.FinalizeWriteStreamRequest) (*storagepb.FinalizeWriteStreamResponse, error) {
@@ -836,4 +851,35 @@ func registerStorageServer(grpcServer *grpc.Server, srv *Server) {
 			streamMap: map[string]*writeStreamStatus{},
 		},
 	)
+}
+
+func (s *storageWriteServer) createDefaultStream(ctx context.Context, parent string) (*storagepb.WriteStream, error) {
+	projectID, datasetID, tableID, err := getIDsFromPath(parent)
+	if err != nil {
+		return nil, err
+	}
+	tableMetadata, err := getTableMetadata(ctx, s.server, projectID, datasetID, tableID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get table metadata: %w", err)
+	}
+	streamName := fmt.Sprintf("%s/streams/_default", parent)
+	schema := types.TableToProto(tableMetadata)
+	stream := &storagepb.WriteStream{
+		Name:        streamName,
+		Type:        storagepb.WriteStream_TYPE_UNSPECIFIED,
+		TableSchema: schema,
+		WriteMode:   storagepb.WriteStream_INSERT,
+	}
+
+	s.mu.Lock()
+	s.streamMap[streamName] = &writeStreamStatus{
+		streamType:    storagepb.WriteStream_TYPE_UNSPECIFIED,
+		stream:        stream,
+		projectID:     projectID,
+		datasetID:     datasetID,
+		tableID:       tableID,
+		tableMetadata: tableMetadata,
+	}
+	s.mu.Unlock()
+	return stream, nil
 }
